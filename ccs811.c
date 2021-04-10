@@ -17,22 +17,7 @@
 #include <string.h>
 #include "transfer_handler.h"
 
-
-int CCS811_appversion;  // Version of the app firmware inside the CCS811 (for workarounds)
-
-// begin() and flash() prints errors to help diagnose startup problems.
-// Change these macro's to empty to suppress those prints.
-//#define PRINTLN(s)    Serial.println(s)
-//#define PRINT(s)      Serial.print(s)
-//#define PRINTLN2(s,m) Serial.println(s,m)
-//#define PRINT2(s,m)   Serial.print(s,m)
-
-//#define F(s)   				(s)
-//#define PRINTLN(s)
-//#define PRINT(s)
-//#define PRINTLN2(s,m)
-//#define PRINT2(s,m)
-
+uint16_t ccs811_appversion;  // Version of the app firmware inside the CCS811 (for workarounds)
 
 // Timings
 #define CCS811_WAIT_AFTER_RESET_US     2000 // The CCS811 needs a wait after reset
@@ -42,9 +27,7 @@ int CCS811_appversion;  // Version of the app firmware inside the CCS811 (for wo
 #define CCS811_WAIT_AFTER_APPVERIFY_MS   70 // The CCS811 needs a wait after app verify
 #define CCS811_WAIT_AFTER_APPDATA_MS     50 // The CCS811 needs a wait after writing app data
 
-
 // Main interface =====================================================================================================
-
 
 // CCS811 registers/mailboxes, all 1 byte except when stated otherwise
 #define CCS811_STATUS           0x00
@@ -67,6 +50,30 @@ int CCS811_appversion;  // Version of the app firmware inside the CCS811 (for wo
 
 #define MAX_RW_LENGTH           8
 
+// The flags for errstat in ccs811_read()
+// ERRSTAT is a merge of two hardware registers: ERROR_ID (bits 15-8) and STATUS (bits 7-0)
+// Also bit 1 (which is always 0 in hardware) is set to 1 when an I2C read error occurs
+#define CCS811_ERRSTAT_ERROR 0x0001             // There is an error, the ERROR_ID register (0xE0) contains the error source
+#define CCS811_ERRSTAT_I2CFAIL 0x0002           // Bit flag added by software: I2C transaction error
+#define CCS811_ERRSTAT_DATA_READY 0x0008        // A new data sample is ready in ALG_RESULT_DATA
+#define CCS811_ERRSTAT_APP_VALID 0x0010         // Valid application firmware loaded
+#define CCS811_ERRSTAT_FW_MODE 0x0080           // Firmware is in application mode (not boot mode)
+#define CCS811_ERRSTAT_WRITE_REG_INVALID 0x0100 // The CCS811 received an I²C write request addressed to this station but with invalid register address ID
+#define CCS811_ERRSTAT_READ_REG_INVALID 0x0200  // The CCS811 received an I²C read request to a mailbox ID that is invalid
+#define CCS811_ERRSTAT_MEASMODE_INVALID 0x0400  // The CCS811 received an I²C request to write an unsupported mode to MEAS_MODE
+#define CCS811_ERRSTAT_MAX_RESISTANCE 0x0800    // The sensor resistance measurement has reached or exceeded the maximum range
+#define CCS811_ERRSTAT_HEATER_FAULT 0x1000      // The heater current in the CCS811 is not in range
+#define CCS811_ERRSTAT_HEATER_SUPPLY 0x2000     // The heater voltage is not being applied correctly
+
+// These flags should not be set. They flag errors.
+#define CCS811_ERRSTAT_HWERRORS (CCS811_ERRSTAT_ERROR | CCS811_ERRSTAT_WRITE_REG_INVALID | CCS811_ERRSTAT_READ_REG_INVALID | CCS811_ERRSTAT_MEASMODE_INVALID | CCS811_ERRSTAT_MAX_RESISTANCE | CCS811_ERRSTAT_HEATER_FAULT | CCS811_ERRSTAT_HEATER_SUPPLY)
+#define CCS811_ERRSTAT_ERRORS (CCS811_ERRSTAT_I2CFAIL | CCS811_ERRSTAT_HWERRORS)
+// These flags should normally be set - after a measurement. They flag data available (and valid app running).
+#define CCS811_ERRSTAT_OK (CCS811_ERRSTAT_DATA_READY | CCS811_ERRSTAT_APP_VALID | CCS811_ERRSTAT_FW_MODE)
+// These flags could be set after a measurement. They flag data is not yet available (and valid app running).
+#define CCS811_ERRSTAT_OK_NODATA (CCS811_ERRSTAT_APP_VALID | CCS811_ERRSTAT_FW_MODE)
+
+
 static void ccs811_write(uint8_t reg, int count, const uint8_t * buf) {
 
 		uint8_t sendbuf[MAX_RW_LENGTH + 1] = {reg};
@@ -76,29 +83,16 @@ static void ccs811_write(uint8_t reg, int count, const uint8_t * buf) {
 }
 
 static void ccs811_read(uint8_t reg, int count, uint8_t * buf) {
-////  Wire.beginTransmission(_slaveaddr);              // START, SLAVEADDR
-////  Wire.write(regaddr);                             // Register address
-////  int wres= Wire.endTransmission(false);           // Repeated START
-////  delayMicroseconds(_i2cdelay_us);                 // Wait
-////  int rres=Wire.requestFrom(_slaveaddr,count);     // From CCS811, read bytes, STOP
-////  for( int i=0; i<count; i++ ) buf[i]=Wire.read();
-////  return (wres==0) && (rres==count);
-
-//	ret_code_t err_code;
-
-//	err_code = nrf_drv_twi_tx(&m_twi, CCS811_ADDR, &regaddr, 1, true);
-//	APP_ERROR_CHECK(err_code);
-//	
-//	nrf_delay_ms(20);
-//	
-//	err_code = nrf_drv_twi_rx(&m_twi, CCS811_ADDR, buf, count);
-//	APP_ERROR_CHECK(err_code);
-//	nrf_delay_ms(20);
-//	return true;
 	
 		iic_send(CCS811_ADDR, &reg, 1, true);
 		iic_read(CCS811_ADDR, buf, count);
 		
+}
+
+static void ccs811_trig(uint8_t reg){
+
+		iic_send(CCS811_ADDR, &reg, 1, false);
+
 }
 
 void ccs811_reset(void){
@@ -109,7 +103,7 @@ void ccs811_reset(void){
 
 }
 
-uint8_t ccs811_readID(void){
+uint8_t ccs811_readHWID(void){
 		
 		uint8_t ret;
 		ccs811_read(CCS811_HW_ID, 1, &ret);
@@ -117,11 +111,27 @@ uint8_t ccs811_readID(void){
 
 }
 
-uint8_t ccs811_readVersion(void){
+uint8_t ccs811_readHWVersion(void){
 		
 		uint8_t ret;
 		ccs811_read(CCS811_HW_VERSION, 1, &ret);
 		return ret;
+
+}
+
+uint16_t ccs811_readFWBootVersion(void){
+		
+		uint8_t ret[2];
+		ccs811_read(CCS811_FW_BOOT_VERSION, 2, ret);
+		return (ret[0] << 8) | ret[1];
+
+}
+
+uint16_t ccs811_readFWAppVersion(void){
+		
+		uint8_t ret[2];
+		ccs811_read(CCS811_FW_APP_VERSION, 2, ret);
+		return (ret[0] << 8) | ret[1];
 
 }
 
@@ -133,173 +143,54 @@ uint8_t ccs811_readStatus(void){
 
 }
 
-uint16_t ccs811_readAppversion(void){
-		
-		uint8_t ret[2];
-		ccs811_read(CCS811_STATUS, 2, ret);
-		return (ret[0] << 8) | ret[1];
 
-}
-
-
-// Reset the CCS811, switch to app mode and check HW_ID. Returns false on problems.
-bool CCS811_begin( void ) {
+bool ccs811_begin( void ) {
   
-//  uint8_t app_start[]= {0x00};
-//  
-//  uint8_t hw_version;
-//  uint8_t app_version[2];
-//  uint8_t status;
-//  bool ok;
-
-//  CCS811_wake_init();
-//  // Wakeup CCS811
-//  CCS811_wake_up();
-
-//    // Try to ping CCS811 (can we reach CCS811 via I2C?)
-//    ok= i2cwrite(0,0,0);
-//    if( !ok ) ok= i2cwrite(0,0,0); // retry
-//    if( !ok ) {
-//      // Try the other slave address
-//      _slaveaddr= CCS811_SLAVEADDR_0 + CCS811_SLAVEADDR_1 - _slaveaddr; // swap address
-//      ok= i2cwrite(0,0,0);
-//      _slaveaddr= CCS811_SLAVEADDR_0 + CCS811_SLAVEADDR_1 - _slaveaddr; // swap back
-//      if( ok ) {
-//        PRINTLN(F("ccs811: wrong slave address, ping successful on other address"));
-//      } else {
-//        PRINTLN(F("ccs811: ping failed (VDD/GND connected? SDA/SCL connected?)"));
-//      }
-//      goto abort_begin;
-//    }
-
     // Invoke a SW reset (bring CCS811 in a know state)
     ccs811_reset();
+	
+		Debug("CCS811 HW ID(0x81): 0x%2x", ccs811_readHWID());
+		Debug("CCS811 HW_VERSION(0x1X): 0x%2x", ccs811_readHWVersion());
+		Debug("CCS811 FW_BOOT_VERSION: 0x%4x", ccs811_readFWBootVersion());
+	
+		ccs811_appversion = ccs811_readFWAppVersion();
+		Debug("CCS811 FW_APP_VERSION: 0x%4x", ccs811_appversion);
 
-//    // Check that HW_ID is 0x81
-//    ok= CCS811_i2cread(CCS811_HW_ID,1,&hw_id);
-////    if( !ok ) {
-////      PRINTLN(F("ccs811: HW_ID read failed"));
-////      goto abort_begin;
-////    }
-//    if( hw_id!=0x81 ) {
-////      PRINT(F("ccs811: Wrong HW_ID: "));
-////      PRINTLN2(hw_id,HEX);
-//			NRF_LOG_INFO("ccs811: Wrong HW_ID: %x", hw_id);
-//      goto abort_begin;
-//    }
-
-//    // Check that HW_VERSION is 0x1X
-//    ok= CCS811_i2cread(CCS811_HW_VERSION,1,&hw_version);
-////    if( !ok ) {
-////      PRINTLN(F("ccs811: HW_VERSION read failed"));
-////      goto abort_begin;
-////    }
-//    if( (hw_version&0xF0)!=0x10 ) {
-////      PRINT(F("ccs811: Wrong HW_VERSION: "));
-////      PRINTLN2(hw_version,HEX);
-//			NRF_LOG_INFO("ccs811: Wrong HW_VERSION: %x", hw_version);
-//      goto abort_begin;
-//    }
-
-    // Check status (after reset, CCS811 should be in boot mode with valid app)
-//    ok= CCS811_i2cread(CCS811_STATUS,1,&status);
-//    if( !ok ) {
-//      PRINTLN(F("ccs811: STATUS read (boot mode) failed"));
-//      goto abort_begin;
-//    }
-		uint8_t status = ccs811_readStatus();
-    if( status != 0x10 ) {
-			Debug("ccs811: Not in boot mode, or no valid app: %x", status);
-      return false;
+		// Switch CCS811 from boot mode into app mode
+		ccs811_trig(CCS811_APP_START);
+		delayMicroseconds(CCS811_WAIT_AFTER_APPSTART_US);
+	
+		if( ccs811_readStatus() != 0x90 ) {
+			
+				Debug("CCS811 Not in app mode, or no valid app");
+				return false;
+			
     }
 
-    // Read the application version
-		uint8_t app_version[2];
-    ok= CCS811_i2cread(CCS811_FW_APP_VERSION,2,app_version);
-//    if( !ok ) {
-//      PRINTLN(F("ccs811: APP_VERSION read failed"));
-//      goto abort_begin;
-//    }
-    CCS811_appversion= app_version[0]*256+app_version[1];
+		return true;
 
-    // Switch CCS811 from boot mode into app mode
-    ok= CCS811_i2cwrite(CCS811_APP_START,0,app_start);
-//    if( !ok ) {
-//      PRINTLN(F("ccs811: Goto app mode failed"));
-//      goto abort_begin;
-//    }
-    nrf_delay_us(CCS811_WAIT_AFTER_APPSTART_US);
-
-    // Check if the switch was successful
-    ok= CCS811_i2cread(CCS811_STATUS,1,&status);
-//    if( !ok ) {
-//      PRINTLN(F("ccs811: STATUS read (app mode) failed"));
-//      goto abort_begin;
-//    }
-    if( status!=0x90 ) {
-//      PRINT(F("ccs811: Not in app mode, or no valid app: "));
-//      PRINTLN2(status,HEX);
-			NRF_LOG_INFO("ccs811: Not in app mode, or no valid app: %x", status);
-      goto abort_begin;
-    }
-
-  // CCS811 back to sleep
-  CCS811_wake_down();
-  // Return success
-  return true;
-
-abort_begin:
-  // CCS811 back to sleep
-  CCS811_wake_down();
-  // Return failure
-  return false;
 }
 
 
 // Switch CCS811 to `mode`, use constants CCS811_MODE_XXX. Returns false on problems.
-bool CCS811_start( int mode ) {
-  uint8_t meas_mode[]= {(uint8_t)(mode<<4)};
-  CCS811_wake_up();
-  bool ok = CCS811_i2cwrite(CCS811_MEAS_MODE,1,meas_mode);
-  CCS811_wake_down();
-  return ok;
+void ccs811_start( uint8_t mode ) {
+	
+		ccs811_write(CCS811_MEAS_MODE, 1, &mode);
+	
 }
 
-
-// Get measurement results from the CCS811, check status via errstat, e.g. ccs811_errstat(errstat)
-void CCS811_read( uint16_t*eco2, uint16_t*etvoc, uint16_t*errstat,uint16_t*raw) {
-  bool    ok;
-  uint8_t buf[8];
-  uint8_t stat;
-  CCS811_wake_up();
-    if( CCS811_appversion<0x2000 ) {
-      ok= CCS811_i2cread(CCS811_STATUS,1,&stat); // CCS811 with pre 2.0.0 firmware has wrong STATUS in CCS811_ALG_RESULT_DATA
-      if( ok && stat==CCS811_ERRSTAT_OK ) ok= CCS811_i2cread(CCS811_ALG_RESULT_DATA,8,buf); else buf[5]=0;
-      buf[4]= stat; // Update STATUS field with correct STATUS
-    } else {
-      ok = CCS811_i2cread(CCS811_ALG_RESULT_DATA,8,buf);
-    }
-  CCS811_wake_down();
-  // Status and error management
-  uint16_t combined = buf[5]*256+buf[4];
-  if( combined & ~(CCS811_ERRSTAT_HWERRORS|CCS811_ERRSTAT_OK) ) ok= false; // Unused bits are 1: I2C transfer error
-  combined &= CCS811_ERRSTAT_HWERRORS|CCS811_ERRSTAT_OK; // Clear all unused bits
-  if( !ok ) combined |= CCS811_ERRSTAT_I2CFAIL;
-  // Clear ERROR_ID if flags are set
-  if( combined & CCS811_ERRSTAT_HWERRORS ) {
-      int err = CCS811_get_errorid();
-      if( err==-1 ) combined |= CCS811_ERRSTAT_I2CFAIL; // Propagate I2C error
-  }
-  // Outputs
-  if( eco2   ) *eco2   = buf[0]*256+buf[1];
-  if( etvoc  ) *etvoc  = buf[2]*256+buf[3];
-  if( errstat) *errstat= combined;
-  if( raw    ) *raw    = buf[6]*256+buf[7];;
+void ccs811_getRawData(uint8_t *current, uint16_t *adcVal){
+		
+		uint8_t ret[2];
+		ccs811_read(CCS811_RAW_DATA, 2, ret);
+		
+		*current = ret[0] >> 2;
+		*adcVal = ((ret[0] << 8) & 0x30) | ret[1];
+	
 }
-
 
 // Returns a string version of an errstat. Note, each call, this string is updated.
-const char * CCS811_errstat_str(uint16_t errstat) {
+static const char * CCS811_errstat_str(uint16_t errstat) {
   static char s[17]; // 16 bits plus terminating zero
   // First the ERROR_ID flags
                                                   s[ 0]='-';
@@ -324,56 +215,80 @@ const char * CCS811_errstat_str(uint16_t errstat) {
   return s;
 }
 
+bool ccs811_getData(uint16_t *eco2, uint16_t *tvoc){
+		
+		uint8_t ret[6];
+		ccs811_read(CCS811_ALG_RESULT_DATA, 5, ret);
+		
+		*eco2 = (ret[0] << 8) | ret[1];
+		*tvoc = (ret[2] << 8) | ret[3];
+	
+		if(ret[4] & 0x01) {  		//ERROR
+				
+				ccs811_read(CCS811_ERROR_ID, 1, &ret[5]);
+				Debug("CCS811 Error :%s", CCS811_errstat_str((ret[5] << 8) | ret[4]));
+		
+		}
+	
+		return ret[4] & 0x08;  //DATA_READY
+	
+}
+
+uint16_t ccs811_getBaseline(){
+
+
+}
+
 
 // Extra interface ========================================================================================
 
 
-// Gets version of the CCS811 hardware (returns 0 on I2C failure)
-int CCS811_hardware_version(void) {
-  uint8_t buf[1];
-  CCS811_wake_up();
-  bool ok = CCS811_i2cread(CCS811_HW_VERSION,1,buf);
-  CCS811_wake_down();
-  int version= -1;
-  if( ok ) version= buf[0];
-  return version;
-}
+//// Gets version of the CCS811 hardware (returns 0 on I2C failure)
+//int CCS811_hardware_version(void) {
+//  uint8_t buf[1];
+//  CCS811_wake_up();
+//  bool ok = CCS811_i2cread(CCS811_HW_VERSION,1,buf);
+//  CCS811_wake_down();
+//  int version= -1;
+//  if( ok ) version= buf[0];
+//  return version;
+//}
 
 
-// Gets version of the CCS811 boot loader (returns 0 on I2C failure)
-int CCS811_bootloader_version(void) {
-  uint8_t buf[2];
-  CCS811_wake_up();
-  bool ok = CCS811_i2cread(CCS811_FW_BOOT_VERSION,2,buf);
-  CCS811_wake_down();
-  int version= -1;
-  if( ok ) version= buf[0]*256+buf[1];
-  return version;
-}
+//// Gets version of the CCS811 boot loader (returns 0 on I2C failure)
+//int CCS811_bootloader_version(void) {
+//  uint8_t buf[2];
+//  CCS811_wake_up();
+//  bool ok = CCS811_i2cread(CCS811_FW_BOOT_VERSION,2,buf);
+//  CCS811_wake_down();
+//  int version= -1;
+//  if( ok ) version= buf[0]*256+buf[1];
+//  return version;
+//}
 
 
-// Gets version of the CCS811 application (returns 0 on I2C failure)
-int CCS811_application_version(void) {
-  uint8_t buf[2];
-  CCS811_wake_up();
-  bool ok = CCS811_i2cread(CCS811_FW_APP_VERSION,2,buf);
-  CCS811_wake_down();
-  int version= -1;
-  if( ok ) version= buf[0]*256+buf[1];
-  return version;
-}
+//// Gets version of the CCS811 application (returns 0 on I2C failure)
+//int CCS811_application_version(void) {
+//  uint8_t buf[2];
+//  CCS811_wake_up();
+//  bool ok = CCS811_i2cread(CCS811_FW_APP_VERSION,2,buf);
+//  CCS811_wake_down();
+//  int version= -1;
+//  if( ok ) version= buf[0]*256+buf[1];
+//  return version;
+//}
 
 
 // Gets the ERROR_ID [same as 'err' part of 'errstat' in 'read'] (returns -1 on I2C failure)
 // Note, this actually clears CCS811_ERROR_ID (hardware feature)
 int CCS811_get_errorid(void) {
-  uint8_t buf[1];
-  CCS811_wake_up();
-  bool ok = CCS811_i2cread(CCS811_ERROR_ID,1,buf);
-  CCS811_wake_down();
-  int version= -1;
-  if( ok ) version= buf[0];
-  return version;
+//  uint8_t buf[1];
+//  CCS811_wake_up();
+//  bool ok = CCS811_i2cread(CCS811_ERROR_ID,1,buf);
+//  CCS811_wake_down();
+//  int version= -1;
+//  if( ok ) version= buf[0];
+//  return version;
 }
 
 
@@ -383,12 +298,12 @@ int CCS811_get_errorid(void) {
 
 // Writes t and h to ENV_DATA (see datasheet for format). Returns false on I2C problems.
 bool CCS811_set_envdata(uint16_t t, uint16_t h) {
-  uint8_t envdata[]= { HI(h), LO(h), HI(t), LO(t) };
-  CCS811_wake_up();
-  // Serial.print(" [T="); Serial.print(t); Serial.print(" H="); Serial.print(h); Serial.println("] ");
-  bool ok = CCS811_i2cwrite(CCS811_ENV_DATA,4,envdata);
-  CCS811_wake_down();
-  return ok;
+//  uint8_t envdata[]= { HI(h), LO(h), HI(t), LO(t) };
+//  CCS811_wake_up();
+//  // Serial.print(" [T="); Serial.print(t); Serial.print(" H="); Serial.print(h); Serial.println("] ");
+//  bool ok = CCS811_i2cwrite(CCS811_ENV_DATA,4,envdata);
+//  CCS811_wake_down();
+//  return ok;
 }
 
 
@@ -410,22 +325,22 @@ bool CCS811_set_envdata210(uint16_t t, uint16_t h) {
 
 // Reads (encoded) baseline from BASELINE (see datasheet). Returns false on I2C problems.
 bool CCS811_get_baseline(uint16_t *baseline) {
-  uint8_t buf[2];
-  CCS811_wake_up();
-  bool ok = CCS811_i2cread(CCS811_BASELINE,2,buf);
-  CCS811_wake_down();
-  *baseline= (buf[0]<<8) + buf[1];
-  return ok;
+//  uint8_t buf[2];
+//  CCS811_wake_up();
+//  bool ok = CCS811_i2cread(CCS811_BASELINE,2,buf);
+//  CCS811_wake_down();
+//  *baseline= (buf[0]<<8) + buf[1];
+//  return ok;
 }
 
 
 // Writes (encoded) baseline to BASELINE (see datasheet). Returns false on I2C problems.
 bool CCS811_set_baseline(uint16_t baseline) {
-  uint8_t buf[]= { HI(baseline), LO(baseline) };
-  CCS811_wake_up();
-  bool ok = CCS811_i2cwrite(CCS811_BASELINE,2,buf);
-  CCS811_wake_down();
-  return ok;
+//  uint8_t buf[]= { HI(baseline), LO(baseline) };
+//  CCS811_wake_up();
+//  bool ok = CCS811_i2cwrite(CCS811_BASELINE,2,buf);
+//  CCS811_wake_down();
+//  return ok;
 }
 
 
@@ -603,26 +518,26 @@ bool CCS811_set_baseline(uint16_t baseline) {
 // Helper interface: nwake pin ========================================================================================
 
 
-// _nwake<0 means nWAKE is not connected to a pin of the host, so no action needed
-void CCS811_wake_init( void ) {
-  nrf_gpio_cfg_output(CCS811_WAKEPIN);
-}
+//// _nwake<0 means nWAKE is not connected to a pin of the host, so no action needed
+//void CCS811_wake_init( void ) {
+//  nrf_gpio_cfg_output(CCS811_WAKEPIN);
+//}
 
 
-void CCS811_wake_up( void) {
-	
-	nrf_gpio_pin_clear(CCS811_WAKEPIN);
-	nrf_delay_us(CCS811_WAIT_AFTER_WAKE_US);
-  //if( _nwake>=0 ) { digitalWrite(_nwake, LOW); delayMicroseconds(CCS811_WAIT_AFTER_WAKE_US);  }
-	
-}
+//void CCS811_wake_up( void) {
+//	
+//	nrf_gpio_pin_clear(CCS811_WAKEPIN);
+//	nrf_delay_us(CCS811_WAIT_AFTER_WAKE_US);
+//  //if( _nwake>=0 ) { digitalWrite(_nwake, LOW); delayMicroseconds(CCS811_WAIT_AFTER_WAKE_US);  }
+//	
+//}
 
 
-void CCS811_wake_down( void) {
-	
-	nrf_gpio_pin_set(CCS811_WAKEPIN);
-  //if( _nwake>=0 ) digitalWrite(_nwake, HIGH);
-}
+//void CCS811_wake_down( void) {
+//	
+//	nrf_gpio_pin_set(CCS811_WAKEPIN);
+//  //if( _nwake>=0 ) digitalWrite(_nwake, HIGH);
+//}
 
 
 // Helper interface: i2c wrapper ======================================================================================

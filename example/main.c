@@ -57,6 +57,7 @@
 #include "nrf_log_default_backends.h"
 
 #include "transfer_handler.h"
+#include "ccs811.h"
 
 /**
  * @brief Function for main application entry.
@@ -69,22 +70,19 @@ int main(void)
     NRF_LOG_INFO("\r\nTWI sensor example started.");
     NRF_LOG_FLUSH();
 	
-	iic_init();
-//	uint16_t id = hdc1080_readDeviceId();
-//	
-//	hdc1080_begin(HDC1080_CONF_HRES_14BIT | HDC1080_CONF_TRES_14BIT);
-//	
-//	NRF_LOG_INFO("id%x",id);
+		iic_init();
+		ccs811_begin();
+		ccs811_start(CCS811_MODE_1SEC);
+		nrf_delay_ms(500);
 	
-	nrf_delay_ms(500);
+		uint16_t eco2, tvoc;
 	
 
     while (true)
     {
-			
-//			NRF_LOG_INFO("temp:%d", hdc1080_readTemperature()*100);
-//			NRF_LOG_INFO("humi:%d", hdc1080_readHumidity()*100);
-			nrf_delay_ms(500);
+				if(ccs811_getData(&eco2, &tvoc))
+					NRF_LOG_INFO("eCO2: %d ppm, TVOC: %d ppb",eco2, tvoc);
+				//nrf_delay_ms(2000);
         NRF_LOG_FLUSH();
     }
 }
